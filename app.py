@@ -142,6 +142,10 @@ def slot_index(month: int, day: int, tod: int) -> int:
 # API ENDPOINTS
 # ============================================================
 
+@app.get("/")
+def root():
+    return {"name": "Illustria API", "ok": True, "health": "/api/health"}
+
 @app.get("/api/dbinfo")
 def dbinfo():
     with connect() as con:
