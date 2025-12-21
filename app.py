@@ -112,6 +112,20 @@ def connect() -> sqlite3.Connection:
     con.execute("PRAGMA mmap_size = 0;")
     con.execute("PRAGMA temp_store = MEMORY;")
     return con
+    
+def table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    rows = con.execute(f"PRAGMA table_info({table});").fetchall()
+    return {r["name"] for r in rows}
+
+def require_cols(con: sqlite3.Connection, table: str, cols: list[str]) -> None:
+    existing = table_columns(con, table)
+    missing = [c for c in cols if c not in existing]
+    if missing:
+        raise HTTPException(
+            status_code=501,
+            detail=f"DB is missing columns in '{table}': {missing}. "
+                   f"Present columns: {sorted(existing)}"
+        )
 
 
 # ============================================================
@@ -216,3 +230,137 @@ def forecast(city_id: int, month: int, day: int, tod: int = 0, days: int = 7):
         "days": days,
         "rows": [dict(r) for r in rows],
     }
+@app.get("/api/cities")
+def list_cities(q: str | None = None, limit: int = 2000, offset: int = 0):
+    """
+    Returns a list of cities for browsing/search.
+    If q is provided, does a simple name LIKE match.
+    """
+    limit = max(1, min(limit, 5000))
+    offset = max(0, offset)
+
+    with connect() as con:
+        cols = table_columns(con, "cities")
+
+        # Prefer refined elev if present
+        elev_expr = (
+            "elev_ft_refined AS elev_ft"
+            if "elev_ft_refined" in cols
+            else ("elev_ft_noisy AS elev_ft" if "elev_ft_noisy" in cols else "NULL AS elev_ft")
+        )
+
+        # Optional geo columns
+        continent_expr = "continent" if "continent" in cols else "NULL AS continent"
+        country_expr = "country" if "country" in cols else "NULL AS country"
+
+        base_sql = f"""
+            SELECT city_id, name, lat, lon,
+                   {elev_expr},
+                   {continent_expr},
+                   {country_expr}
+            FROM cities
+        """
+
+        params: list[object] = []
+        if q:
+            base_sql += " WHERE name LIKE ? "
+            params.append(f"%{q}%")
+
+        base_sql += " ORDER BY city_id LIMIT ? OFFSET ? "
+        params.extend([limit, offset])
+
+        rows = con.execute(base_sql, params).fetchall()
+        return {"count": len(rows), "rows": [dict(r) for r in rows]}
+
+
+@app.get("/api/continents")
+def list_continents():
+    """
+    List distinct continent names present in cities table.
+    Requires 'continent' column in cities table.
+    """
+    with connect() as con:
+        require_cols(con, "cities", ["continent"])
+        rows = con.execute(
+            "SELECT continent, COUNT(*) AS city_count "
+            "FROM cities "
+            "WHERE continent IS NOT NULL AND TRIM(continent) != '' "
+            "GROUP BY continent "
+            "ORDER BY city_count DESC, continent ASC;"
+        ).fetchall()
+        return {"count": len(rows), "rows": [dict(r) for r in rows]}
+
+
+@app.get("/api/countries")
+def list_countries(continent: str | None = None):
+    """
+    List distinct countries (optionally filtered by continent).
+    Requires 'country' column (and 'continent' if filtering).
+    """
+    with connect() as con:
+        require_cols(con, "cities", ["country"])
+        if continent is not None:
+            require_cols(con, "cities", ["continent"])
+            rows = con.execute(
+                "SELECT country, COUNT(*) AS city_count "
+                "FROM cities "
+                "WHERE country IS NOT NULL AND TRIM(country) != '' "
+                "  AND continent = ? "
+                "GROUP BY country "
+                "ORDER BY city_count DESC, country ASC;",
+                (continent,),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT country, COUNT(*) AS city_count "
+                "FROM cities "
+                "WHERE country IS NOT NULL AND TRIM(country) != '' "
+                "GROUP BY country "
+                "ORDER BY city_count DESC, country ASC;"
+            ).fetchall()
+
+        return {"count": len(rows), "rows": [dict(r) for r in rows]}
+
+
+@app.get("/api/cities/by_continent")
+def cities_by_continent(continent: str, limit: int = 5000, offset: int = 0):
+    """
+    Cities in a continent.
+    Requires 'continent' column.
+    """
+    limit = max(1, min(limit, 5000))
+    offset = max(0, offset)
+
+    with connect() as con:
+        require_cols(con, "cities", ["continent"])
+        rows = con.execute(
+            "SELECT city_id, name, lat, lon "
+            "FROM cities "
+            "WHERE continent = ? "
+            "ORDER BY city_id "
+            "LIMIT ? OFFSET ?;",
+            (continent, limit, offset),
+        ).fetchall()
+        return {"continent": continent, "count": len(rows), "rows": [dict(r) for r in rows]}
+
+
+@app.get("/api/cities/by_country")
+def cities_by_country(country: str, limit: int = 5000, offset: int = 0):
+    """
+    Cities in a country.
+    Requires 'country' column.
+    """
+    limit = max(1, min(limit, 5000))
+    offset = max(0, offset)
+
+    with connect() as con:
+        require_cols(con, "cities", ["country"])
+        rows = con.execute(
+            "SELECT city_id, name, lat, lon "
+            "FROM cities "
+            "WHERE country = ? "
+            "ORDER BY city_id "
+            "LIMIT ? OFFSET ?;",
+            (country, limit, offset),
+        ).fetchall()
+        return {"country": country, "count": len(rows), "rows": [dict(r) for r in rows]}
