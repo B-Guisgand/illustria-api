@@ -1,3 +1,4 @@
+import tempfile
 import os
 import math
 import sqlite3
@@ -35,30 +36,23 @@ app.add_middleware(
 )
 
 # ============================================================
-# DATABASE DOWNLOAD + OPEN
+# DATABASE Download to file
 # ============================================================
 
-def _download_bytes(url: str) -> bytes:
+def _download_to_file(url: str, out_path: Path) -> None:
     """
-    Download bytes from a URL.
-    Handles Google Drive confirmation pages for large files.
+    Stream download to disk (low memory).
+    Works for GitHub release asset URLs (no HTML interstitial).
     """
-    session = requests.Session()
-    r = session.get(url, timeout=180)
-    r.raise_for_status()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Google Drive sometimes returns HTML with a confirm token
-    if "text/html" in r.headers.get("Content-Type", "").lower():
-        match = re.search(r"confirm=([0-9A-Za-z_]+)", r.text)
-        if match:
-            token = match.group(1)
-            sep = "&" if "?" in url else "?"
-            confirm_url = f"{url}{sep}confirm={token}"
-            r2 = session.get(confirm_url, timeout=180)
-            r2.raise_for_status()
-            return r2.content
+    with requests.get(url, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                if chunk:
+                    f.write(chunk)
 
-    return r.content
 
 def _looks_like_sqlite(p: Path) -> bool:
     try:
@@ -68,54 +62,64 @@ def _looks_like_sqlite(p: Path) -> bool:
     except Exception:
         return False
 
+
 def ensure_db_present():
-    """
-    Download + extract the SQLite DB if not already present OR if the cached file is invalid.
-    """
     if not DB_URL:
         raise RuntimeError("ILLUSTRIA_DB_URL environment variable is not set")
 
     db_path = Path(DB_PATH)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # If a file exists but is NOT SQLite, delete it (it's likely HTML or partial content)
+    # If cached file exists but isn't SQLite, delete it
     if db_path.exists() and not _looks_like_sqlite(db_path):
-        try:
-            db_path.unlink()
-        except Exception as e:
-            raise RuntimeError(f"Cached DB is invalid and could not be deleted: {e}")
+        db_path.unlink()
 
-    # If a valid SQLite DB exists, keep it
+    # If valid DB exists, keep it
     if db_path.exists() and _looks_like_sqlite(db_path) and db_path.stat().st_size > 1_000_000:
         return
 
-    # Download payload
-    payload = _download_bytes(DB_URL)
+    # Stream download to a temp file on disk
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        tmp = td / ("payload.zip" if DB_URL.lower().endswith(".zip") else "payload.bin")
 
-    # If URL points to ZIP, extract the first .db found
-    if DB_URL.lower().endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(payload)) as z:
-            db_files = [n for n in z.namelist() if n.lower().endswith(".db")]
-            if not db_files:
-                raise RuntimeError("ZIP did not contain a .db file")
-            with z.open(db_files[0]) as src, open(db_path, "wb") as dst:
-                dst.write(src.read())
-    else:
-        # Otherwise assume the payload IS the DB
-        with open(db_path, "wb") as f:
-            f.write(payload)
+        _download_to_file(DB_URL, tmp)
+
+        if DB_URL.lower().endswith(".zip"):
+            with zipfile.ZipFile(tmp) as z:
+                db_files = [n for n in z.namelist() if n.lower().endswith(".db")]
+                if not db_files:
+                    raise RuntimeError("ZIP did not contain a .db file")
+
+                # Extract DB by streaming from zip member to destination file
+                with z.open(db_files[0]) as src, open(db_path, "wb") as dst:
+                    while True:
+                        buf = src.read(1024 * 1024)  # 1MB
+                        if not buf:
+                            break
+                        dst.write(buf)
+        else:
+            # payload is the db
+            tmp.replace(db_path)
 
     # Final validation
     if not _looks_like_sqlite(db_path):
-        # Peek at the header for debugging
         with open(db_path, "rb") as f:
-            header = f.read(64)
-        raise RuntimeError(f"Downloaded/extracted file is not SQLite. Header starts with: {header!r}")
+            head = f.read(64)
+        raise RuntimeError(f"Downloaded file is not SQLite. Head={head!r}")
 
-def connect():
+ def connect():
     ensure_db_present()
-    con = sqlite3.connect(DB_PATH)
+
+    # Open read-only to avoid journaling and reduce overhead
+    uri = f"file:{DB_PATH}?mode=ro"
+    con = sqlite3.connect(uri, uri=True, check_same_thread=False)
     con.row_factory = sqlite3.Row
+
+    # Reduce SQLite memory use
+    con.execute("PRAGMA cache_size = -20000;")  # ~20MB cache (negative = KB)
+    con.execute("PRAGMA temp_store = MEMORY;")
+    con.execute("PRAGMA mmap_size = 0;")        # disable mmap (can spike memory)
     return con
 
 # ============================================================
