@@ -1,86 +1,49 @@
-import os
-import math
-import sqlite3
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import zipfile
+import io
+import re
 
-DB_PATH = os.environ.get("ILLUSTRIA_DB_PATH", "./illustria.db")
+def _download_bytes(url: str) -> bytes:
+    """
+    Download bytes from url. Handles Google Drive confirm tokens if needed.
+    """
+    s = requests.Session()
+    r = s.get(url, timeout=180)
+    r.raise_for_status()
 
-app = FastAPI(title="Illustria Weather API")
+    # If Drive returns an HTML confirmation page, look for confirm token
+    ctype = r.headers.get("Content-Type", "")
+    if "text/html" in ctype.lower():
+        m = re.search(r"confirm=([0-9A-Za-z_]+)", r.text)
+        if m:
+            token = m.group(1)
+            sep = "&" if "?" in url else "?"
+            url2 = f"{url}{sep}confirm={token}"
+            r2 = s.get(url2, timeout=180)
+            r2.raise_for_status()
+            return r2.content
 
-# Allow your Cloudflare Pages site to call the API from the browser
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten later
-    allow_credentials=False,
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
+    return r.content
 
-def connect():
-    if not os.path.exists(DB_PATH):
-        raise RuntimeError(f"DB file not found at {DB_PATH}")
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+def ensure_db_present():
+    db_path = Path(DB_LOCAL_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
-def haversine_miles(lat1, lon1, lat2, lon2):
-    R = 3958.7613
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlmb = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
-    return 2*R*math.asin(math.sqrt(a))
+    # If already present and non-trivial size, keep it
+    if db_path.exists() and db_path.stat().st_size > 10_000_000:
+        return
 
-@app.get("/api/health")
-def health():
-    return {"ok": True}
+    if not DB_URL:
+        raise RuntimeError("ILLUSTRIA_DB_URL is not set and DB file is missing.")
 
-@app.get("/api/city/{city_id}")
-def city(city_id: int):
-    with connect() as con:
-        row = con.execute("""
-        SELECT city_id, name, lat, lon,
-               elev_ft_refined AS elev_ft,
-               trewartha, biomes,
-               dist_to_coast_mi, relief_100mi_ft,
-               terrain_type, terrain_flavor
-        FROM cities
-        WHERE city_id = ?;
-        """, (city_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Unknown city_id")
-        return dict(row)
+    payload = _download_bytes(DB_URL)
 
-@app.get("/api/nearest")
-def nearest(lat: float, lon: float):
-    with connect() as con:
-        cities = con.execute("SELECT city_id, name, lat, lon FROM cities WHERE lat IS NOT NULL AND lon IS NOT NULL;").fetchall()
-        best = None
-        for r in cities:
-            d = haversine_miles(lat, lon, r["lat"], r["lon"])
-            if best is None or d < best[0]:
-                best = (d, r["city_id"], r["name"], r["lat"], r["lon"])
-        if not best:
-            raise HTTPException(404, "No cities found")
-        return {"distance_mi": best[0], "city_id": best[1], "name": best[2], "lat": best[3], "lon": best[4]}
-
-def slot_index(month: int, day: int, tod: int) -> int:
-    return ((month-1)*30 + (day-1))*3 + tod
-
-@app.get("/api/forecast")
-def forecast(city_id: int, month: int, day: int, tod: int = 0, days: int = 7):
-    start = slot_index(month, day, tod)
-    end = start + days*3
-    with connect() as con:
-        rows = con.execute("""
-        SELECT month, day, tod, condition, temp_f, wind_mph, prcp_in,
-               cloud_oktas
-        FROM weather
-        WHERE city_id = ?
-          AND slot_index >= ?
-          AND slot_index < ?
-        ORDER BY slot_index;
-        """, (city_id, start, end)).fetchall()
-        return {"city_id": city_id, "start": {"month": month, "day": day, "tod": tod}, "days": days, "rows": [dict(r) for r in rows]}
+    if DB_URL.lower().endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(payload)) as z:
+            db_names = [n for n in z.namelist() if n.lower().endswith(".db")]
+            if not db_names:
+                raise RuntimeError("ZIP did not contain a .db file")
+            with z.open(db_names[0]) as src, open(db_path, "wb") as dst:
+                dst.write(src.read())
+    else:
+        with open(db_path, "wb") as f:
+            f.write(payload)
