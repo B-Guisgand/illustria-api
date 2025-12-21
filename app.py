@@ -60,10 +60,17 @@ def _download_bytes(url: str) -> bytes:
 
     return r.content
 
+def _looks_like_sqlite(p: Path) -> bool:
+    try:
+        with open(p, "rb") as f:
+            header = f.read(16)
+        return header[:15] == b"SQLite format 3"
+    except Exception:
+        return False
 
 def ensure_db_present():
     """
-    Download + extract the SQLite DB if not already present.
+    Download + extract the SQLite DB if not already present OR if the cached file is invalid.
     """
     if not DB_URL:
         raise RuntimeError("ILLUSTRIA_DB_URL environment variable is not set")
@@ -71,13 +78,21 @@ def ensure_db_present():
     db_path = Path(DB_PATH)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # If DB already exists and looks real, keep it
-    if db_path.exists() and db_path.stat().st_size > 10_000_000:
+    # If a file exists but is NOT SQLite, delete it (it's likely HTML or partial content)
+    if db_path.exists() and not _looks_like_sqlite(db_path):
+        try:
+            db_path.unlink()
+        except Exception as e:
+            raise RuntimeError(f"Cached DB is invalid and could not be deleted: {e}")
+
+    # If a valid SQLite DB exists, keep it
+    if db_path.exists() and _looks_like_sqlite(db_path) and db_path.stat().st_size > 1_000_000:
         return
 
+    # Download payload
     payload = _download_bytes(DB_URL)
 
-    # Handle ZIP or raw DB
+    # If URL points to ZIP, extract the first .db found
     if DB_URL.lower().endswith(".zip"):
         with zipfile.ZipFile(io.BytesIO(payload)) as z:
             db_files = [n for n in z.namelist() if n.lower().endswith(".db")]
@@ -86,9 +101,16 @@ def ensure_db_present():
             with z.open(db_files[0]) as src, open(db_path, "wb") as dst:
                 dst.write(src.read())
     else:
+        # Otherwise assume the payload IS the DB
         with open(db_path, "wb") as f:
             f.write(payload)
 
+    # Final validation
+    if not _looks_like_sqlite(db_path):
+        # Peek at the header for debugging
+        with open(db_path, "rb") as f:
+            header = f.read(64)
+        raise RuntimeError(f"Downloaded/extracted file is not SQLite. Header starts with: {header!r}")
 
 def connect():
     ensure_db_present()
