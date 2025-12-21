@@ -120,6 +120,18 @@ def slot_index(month: int, day: int, tod: int) -> int:
 # API ENDPOINTS
 # ============================================================
 
+@app.get("/api/dbinfo")
+def dbinfo():
+    with connect() as con:
+        tables = [r["name"] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
+        ).fetchall()]
+        out = {"tables": tables, "columns": {}}
+        for t in tables:
+            cols = [r["name"] for r in con.execute(f"PRAGMA table_info({t});").fetchall()]
+            out["columns"][t] = cols
+        return out
+
 @app.get("/api/health")
 def health():
     """
