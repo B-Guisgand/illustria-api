@@ -112,10 +112,12 @@ def connect() -> sqlite3.Connection:
     con.execute("PRAGMA mmap_size = 0;")
     con.execute("PRAGMA temp_store = MEMORY;")
     return con
-    
+
+
 def table_columns(con: sqlite3.Connection, table: str) -> set[str]:
     rows = con.execute(f"PRAGMA table_info({table});").fetchall()
     return {r["name"] for r in rows}
+
 
 def require_cols(con: sqlite3.Connection, table: str, cols: list[str]) -> None:
     existing = table_columns(con, table)
@@ -160,11 +162,15 @@ def health():
 @app.get("/api/city/{city_id}")
 def get_city(city_id: int):
     with connect() as con:
+        # PATCH: require & return continent/country
+        require_cols(con, "cities", ["continent", "country"])
+
         row = con.execute(
             """
             SELECT city_id, name, lat, lon,
                    elev_ft_refined AS elev_ft,
                    trewartha, biomes,
+                   continent, country,
                    dist_to_coast_mi, relief_100mi_ft,
                    terrain_type, terrain_flavor
             FROM cities
@@ -230,6 +236,8 @@ def forecast(city_id: int, month: int, day: int, tod: int = 0, days: int = 7):
         "days": days,
         "rows": [dict(r) for r in rows],
     }
+
+
 @app.get("/api/cities")
 def list_cities(q: str | None = None, limit: int = 2000, offset: int = 0):
     """
