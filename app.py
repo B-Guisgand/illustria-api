@@ -4,7 +4,7 @@ import sqlite3
 import zipfile
 import tempfile
 from pathlib import Path
-
+import shutil
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -94,7 +94,11 @@ def ensure_db_present() -> None:
                      dst.write(buf)
 
             # Atomic replace so we never leave a half-written DB at DB_PATH
-            tmp_db.replace(db_path)
+            # Copy to same filesystem first, then atomically replace within target directory
+            tmp_target = db_path.with_suffix(db_path.suffix + ".tmp")
+            shutil.copyfile(tmp_db, tmp_target)
+            os.replace(tmp_target, db_path)
+
 
 
     # Final validation
@@ -102,6 +106,8 @@ def ensure_db_present() -> None:
         with open(db_path, "rb") as f:
             head = f.read(64)
         raise RuntimeError(f"Extracted file is not SQLite. Head={head!r}")
+    if tmp_target.stat().st_size < 1_000_000:
+    raise RuntimeError("Copied DB is unexpectedly small; refusing to install.")
 
 
 def connect() -> sqlite3.Connection:
