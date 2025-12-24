@@ -5,6 +5,7 @@ import zipfile
 import tempfile
 from pathlib import Path
 import shutil
+
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,8 +14,11 @@ from fastapi.middleware.cors import CORSMiddleware
 # CONFIG (Render env vars)
 # ============================================================
 
-DB_URL = os.environ.get("ILLUSTRIA_DB_URL")  # should be a direct .zip asset URL
-DB_PATH = os.environ.get("ILLUSTRIA_DB_PATH", "/opt/render/project/src/data/illustria.db")
+DB_URL = os.environ.get("ILLUSTRIA_DB_URL")  # direct .zip asset URL (GitHub Release asset)
+DB_PATH = os.environ.get(
+    "ILLUSTRIA_DB_PATH",
+    "/opt/render/project/src/data/illustria.db",
+)
 
 # ============================================================
 # FASTAPI
@@ -25,7 +29,7 @@ app = FastAPI(title="Illustria Weather API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
-    allow_methods=["*"],
+    allow_methods=["*"],  # allow OPTIONS preflight too
     allow_headers=["*"],
 )
 
@@ -36,7 +40,7 @@ def root():
 
 
 # ============================================================
-# DB download/extract (LOW MEMORY)
+# DB download/extract (LOW MEMORY + SAFE INSTALL)
 # ============================================================
 
 def _looks_like_sqlite(p: Path) -> bool:
@@ -59,6 +63,15 @@ def _download_to_file(url: str, out_path: Path) -> None:
 
 
 def ensure_db_present() -> None:
+    """
+    Ensures a valid SQLite DB exists at DB_PATH.
+
+    Safety features:
+    - Deletes cached file if it doesn't look like SQLite
+    - Downloads + extracts ZIP to a temp directory
+    - Copies extracted DB to target filesystem, then atomically replaces
+      (avoids cross-device link errors on Render)
+    """
     if not DB_URL:
         raise RuntimeError("ILLUSTRIA_DB_URL environment variable is not set")
 
@@ -67,7 +80,10 @@ def ensure_db_present() -> None:
 
     # If cached file exists but isn't SQLite, delete it
     if db_path.exists() and not _looks_like_sqlite(db_path):
-        db_path.unlink()
+        try:
+            db_path.unlink()
+        except Exception:
+            pass
 
     # If valid DB exists, keep it
     if db_path.exists() and _looks_like_sqlite(db_path) and db_path.stat().st_size > 1_000_000:
@@ -87,25 +103,36 @@ def ensure_db_present() -> None:
 
             tmp_db = td_path / "extracted.db"
             with z.open(db_files[0]) as src, open(tmp_db, "wb") as dst:
-                 while True:
-                     buf = src.read(1024 * 1024)
-                     if not buf:
-                         break
-                     dst.write(buf)
+                while True:
+                    buf = src.read(1024 * 1024)
+                    if not buf:
+                        break
+                    dst.write(buf)
 
-            # Atomic replace so we never leave a half-written DB at DB_PATH
-            # Copy to same filesystem first, then atomically replace within target directory
-            tmp_target = db_path.with_suffix(db_path.suffix + ".tmp")
-            shutil.copyfile(tmp_db, tmp_target)
-            os.replace(tmp_target, db_path)
+        # Install DB safely on Render:
+        # - Copy across devices/filesystems (tmp -> /opt/render/...)
+        # - Then atomic replace within the target filesystem
+        tmp_target = db_path.with_suffix(db_path.suffix + ".tmp")
+        shutil.copyfile(tmp_db, tmp_target)
+        os.replace(tmp_target, db_path)
 
-
-    # Final validation
+    # Final validation: header check
     if not _looks_like_sqlite(db_path):
         with open(db_path, "rb") as f:
             head = f.read(64)
         raise RuntimeError(f"Extracted file is not SQLite. Head={head!r}")
-    
+
+    # Optional quick SQLite sanity check (catches some corrupt cases early)
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("PRAGMA schema_version;").fetchone()
+        con.close()
+    except Exception:
+        try:
+            db_path.unlink()
+        except Exception:
+            pass
+        raise RuntimeError("Installed DB failed SQLite sanity check; deleted and will re-download on next request.")
 
 
 def connect() -> sqlite3.Connection:
@@ -156,8 +183,10 @@ def require_cols(con: sqlite3.Connection, table: str, cols: list[str]) -> None:
     if missing:
         raise HTTPException(
             status_code=501,
-            detail=f"DB is missing columns in '{table}': {missing}. "
-                   f"Present columns: {sorted(existing)}"
+            detail=(
+                f"DB is missing columns in '{table}': {missing}. "
+                f"Present columns: {sorted(existing)}"
+            ),
         )
 
 
@@ -192,9 +221,20 @@ def health():
 
 @app.get("/api/city/{city_id}")
 def get_city(city_id: int):
+    """
+    City detail.
+    This is intentionally "schema-tolerant" so the frontend can keep working
+    while the DB evolves. Fields missing in older DB versions will return null.
+    """
     with connect() as con:
         cols = table_columns(con, "cities")
-        require_cols(con, "cities", ["continent", "country", "svg_x", "svg_y"])
+
+        # Require only the minimum core identifier. (SQLite will always have city_id if table exists)
+        # If svg coords exist, we return them. If not, they come back as NULL.
+        def col_or_null(name: str, alias: str | None = None) -> str:
+            if name in cols:
+                return f"{name}" if alias is None else f"{name} AS {alias}"
+            return f"NULL AS {alias or name}"
 
         elev_expr = (
             "elev_ft_refined AS elev_ft" if "elev_ft_refined" in cols
@@ -204,7 +244,10 @@ def get_city(city_id: int):
             "trewartha AS trewartha" if "trewartha" in cols
             else ("climate_trewartha AS trewartha" if "climate_trewartha" in cols else "NULL AS trewartha")
         )
-        biomes_expr = "biomes" if "biomes" in cols else ("biome AS biomes" if "biome" in cols else "NULL AS biomes")
+        biomes_expr = (
+            "biomes" if "biomes" in cols
+            else ("biome AS biomes" if "biome" in cols else "NULL AS biomes")
+        )
 
         dist_expr = (
             "dist_to_coast_mi" if "dist_to_coast_mi" in cols
@@ -216,16 +259,22 @@ def get_city(city_id: int):
         terrain_flavor_expr = "terrain_flavor" if "terrain_flavor" in cols else "NULL AS terrain_flavor"
 
         sql = f"""
-            SELECT city_id, name, lat, lon,
-                   svg_x, svg_y,
-                   {elev_expr},
-                   {trew_expr},
-                   {biomes_expr},
-                   continent, country,
-                   {dist_expr} AS dist_to_coast_mi,
-                   {relief_expr},
-                   {terrain_type_expr},
-                   {terrain_flavor_expr}
+            SELECT
+              city_id,
+              {col_or_null("name")},
+              {col_or_null("lat")},
+              {col_or_null("lon")},
+              {col_or_null("svg_x")},
+              {col_or_null("svg_y")},
+              {elev_expr},
+              {trew_expr},
+              {biomes_expr},
+              {col_or_null("continent")},
+              {col_or_null("country")},
+              {dist_expr} AS dist_to_coast_mi,
+              {relief_expr},
+              {terrain_type_expr},
+              {terrain_flavor_expr}
             FROM cities
             WHERE city_id = ?;
         """
@@ -235,7 +284,6 @@ def get_city(city_id: int):
         raise HTTPException(404, "City not found")
 
     return dict(row)
-
 
 
 @app.get("/api/nearest")
@@ -263,19 +311,25 @@ def nearest_city(lat: float, lon: float):
         "distance_mi": d,
     }
 
+
 @app.get("/api/nearest_svg")
 def nearest_city_svg(svg_x: float, svg_y: float):
     with connect() as con:
-        require_cols(con, "cities", ["svg_x", "svg_y"])
+        cols = table_columns(con, "cities")
+        if "svg_x" not in cols or "svg_y" not in cols:
+            raise HTTPException(501, "DB is missing svg_x/svg_y; nearest_svg not available yet.")
+
         rows = con.execute(
-            "SELECT city_id, name, svg_x, svg_y FROM cities WHERE svg_x IS NOT NULL AND svg_y IS NOT NULL;"
+            "SELECT city_id, name, svg_x, svg_y "
+            "FROM cities "
+            "WHERE svg_x IS NOT NULL AND svg_y IS NOT NULL;"
         ).fetchall()
 
     best = None
     for r in rows:
         dx = (r["svg_x"] - svg_x)
         dy = (r["svg_y"] - svg_y)
-        d2 = dx*dx + dy*dy
+        d2 = dx * dx + dy * dy
         if best is None or d2 < best[0]:
             best = (d2, r)
 
@@ -325,14 +379,12 @@ def list_cities(q: str | None = None, limit: int = 2000, offset: int = 0):
     with connect() as con:
         cols = table_columns(con, "cities")
 
-        # Prefer refined elev if present
         elev_expr = (
             "elev_ft_refined AS elev_ft"
             if "elev_ft_refined" in cols
             else ("elev_ft_noisy AS elev_ft" if "elev_ft_noisy" in cols else "NULL AS elev_ft")
         )
 
-        # Optional geo columns
         continent_expr = "continent" if "continent" in cols else "NULL AS continent"
         country_expr = "country" if "country" in cols else "NULL AS country"
 
@@ -358,10 +410,6 @@ def list_cities(q: str | None = None, limit: int = 2000, offset: int = 0):
 
 @app.get("/api/continents")
 def list_continents():
-    """
-    List distinct continent names present in cities table.
-    Requires 'continent' column in cities table.
-    """
     with connect() as con:
         require_cols(con, "cities", ["continent"])
         rows = con.execute(
@@ -376,10 +424,6 @@ def list_continents():
 
 @app.get("/api/countries")
 def list_countries(continent: str | None = None):
-    """
-    List distinct countries (optionally filtered by continent).
-    Requires 'country' column (and 'continent' if filtering).
-    """
     with connect() as con:
         require_cols(con, "cities", ["country"])
         if continent is not None:
@@ -407,43 +451,49 @@ def list_countries(continent: str | None = None):
 
 @app.get("/api/cities/by_continent")
 def cities_by_continent(continent: str, limit: int = 5000, offset: int = 0):
-    """
-    Cities in a continent.
-    Requires 'continent' column.
-    """
     limit = max(1, min(limit, 5000))
     offset = max(0, offset)
 
     with connect() as con:
-        require_cols(con, "cities", ["continent", "svg_x", "svg_y"])
+        cols = table_columns(con, "cities")
+        require_cols(con, "cities", ["continent"])
+
+        select_cols = "city_id, name, lat, lon"
+        if "svg_x" in cols and "svg_y" in cols:
+            select_cols += ", svg_x, svg_y"
+
         rows = con.execute(
-            "SELECT city_id, name, lat, lon, svg_x, svg_y "
+            f"SELECT {select_cols} "
             "FROM cities "
             "WHERE continent = ? "
             "ORDER BY city_id "
             "LIMIT ? OFFSET ?;",
             (continent, limit, offset),
         ).fetchall()
+
         return {"continent": continent, "count": len(rows), "rows": [dict(r) for r in rows]}
 
 
 @app.get("/api/cities/by_country")
 def cities_by_country(country: str, limit: int = 5000, offset: int = 0):
-    """
-    Cities in a country.
-    Requires 'country' column.
-    """
     limit = max(1, min(limit, 5000))
     offset = max(0, offset)
 
     with connect() as con:
-        require_cols(con, "cities", ["country", "svg_x", "svg_y"])
+        cols = table_columns(con, "cities")
+        require_cols(con, "cities", ["country"])
+
+        select_cols = "city_id, name, lat, lon"
+        if "svg_x" in cols and "svg_y" in cols:
+            select_cols += ", svg_x, svg_y"
+
         rows = con.execute(
-            "SELECT city_id, name, lat, lon, svg_x, svg_y "
+            f"SELECT {select_cols} "
             "FROM cities "
             "WHERE country = ? "
             "ORDER BY city_id "
             "LIMIT ? OFFSET ?;",
             (country, limit, offset),
         ).fetchall()
+
         return {"country": country, "count": len(rows), "rows": [dict(r) for r in rows]}
