@@ -85,12 +85,17 @@ def ensure_db_present() -> None:
             if not db_files:
                 raise RuntimeError("ZIP did not contain a .db file")
 
-            with z.open(db_files[0]) as src, open(db_path, "wb") as dst:
-                while True:
-                    buf = src.read(1024 * 1024)
-                    if not buf:
-                        break
-                    dst.write(buf)
+            tmp_db = td_path / "extracted.db"
+            with z.open(db_files[0]) as src, open(tmp_db, "wb") as dst:
+                 while True:
+                     buf = src.read(1024 * 1024)
+                     if not buf:
+                         break
+                     dst.write(buf)
+
+            # Atomic replace so we never leave a half-written DB at DB_PATH
+            tmp_db.replace(db_path)
+
 
     # Final validation
     if not _looks_like_sqlite(db_path):
@@ -100,18 +105,40 @@ def ensure_db_present() -> None:
 
 
 def connect() -> sqlite3.Connection:
+    """
+    Open a read-only SQLite connection.
+    If the DB on disk is corrupted/truncated, delete it and re-download once.
+    """
+    def _open() -> sqlite3.Connection:
+        uri = f"file:{DB_PATH}?mode=ro"
+        con = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        # Reduce memory use
+        con.execute("PRAGMA cache_size = -20000;")  # ~20MB
+        con.execute("PRAGMA mmap_size = 0;")
+        con.execute("PRAGMA temp_store = MEMORY;")
+        return con
+
     ensure_db_present()
 
-    # Read-only connection (reduces journaling + memory)
-    uri = f"file:{DB_PATH}?mode=ro"
-    con = sqlite3.connect(uri, uri=True, check_same_thread=False)
-    con.row_factory = sqlite3.Row
+    try:
+        return _open()
+    except sqlite3.DatabaseError as e:
+        msg = str(e).lower()
 
-    # Reduce memory use
-    con.execute("PRAGMA cache_size = -20000;")  # ~20MB
-    con.execute("PRAGMA mmap_size = 0;")
-    con.execute("PRAGMA temp_store = MEMORY;")
-    return con
+        # If the DB file is corrupted or truncated, wipe and re-download once.
+        if "malformed" in msg or "disk image is malformed" in msg or "file is not a database" in msg:
+            try:
+                p = Path(DB_PATH)
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+            ensure_db_present()
+            return _open()
+
+        raise
 
 
 def table_columns(con: sqlite3.Connection, table: str) -> set[str]:
