@@ -25,7 +25,7 @@ app = FastAPI(title="Illustria Weather API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten later
-    allow_methods=["GET"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -189,28 +189,49 @@ def health():
 @app.get("/api/city/{city_id}")
 def get_city(city_id: int):
     with connect() as con:
-        # PATCH: require & return continent/country
+        cols = table_columns(con, "cities")
         require_cols(con, "cities", ["continent", "country", "svg_x", "svg_y"])
 
-        row = con.execute(
-            """
+        elev_expr = (
+            "elev_ft_refined AS elev_ft" if "elev_ft_refined" in cols
+            else ("elev_ft AS elev_ft" if "elev_ft" in cols else "NULL AS elev_ft")
+        )
+        trew_expr = (
+            "trewartha AS trewartha" if "trewartha" in cols
+            else ("climate_trewartha AS trewartha" if "climate_trewartha" in cols else "NULL AS trewartha")
+        )
+        biomes_expr = "biomes" if "biomes" in cols else ("biome AS biomes" if "biome" in cols else "NULL AS biomes")
+
+        dist_expr = (
+            "dist_to_coast_mi" if "dist_to_coast_mi" in cols
+            else ("dist_to_ocean_km AS dist_to_coast_mi" if "dist_to_ocean_km" in cols else "NULL AS dist_to_coast_mi")
+        )
+
+        relief_expr = "relief_100mi_ft" if "relief_100mi_ft" in cols else "NULL AS relief_100mi_ft"
+        terrain_type_expr = "terrain_type" if "terrain_type" in cols else "NULL AS terrain_type"
+        terrain_flavor_expr = "terrain_flavor" if "terrain_flavor" in cols else "NULL AS terrain_flavor"
+
+        sql = f"""
             SELECT city_id, name, lat, lon,
-                   svg_x, svg_y
-                   elev_ft_refined AS elev_ft,
-                   trewartha, biomes,
+                   svg_x, svg_y,
+                   {elev_expr},
+                   {trew_expr},
+                   {biomes_expr},
                    continent, country,
-                   dist_to_coast_mi, relief_100mi_ft,
-                   terrain_type, terrain_flavor
+                   {dist_expr} AS dist_to_coast_mi,
+                   {relief_expr},
+                   {terrain_type_expr},
+                   {terrain_flavor_expr}
             FROM cities
             WHERE city_id = ?;
-            """,
-            (city_id,),
-        ).fetchone()
+        """
+        row = con.execute(sql, (city_id,)).fetchone()
 
     if not row:
         raise HTTPException(404, "City not found")
 
     return dict(row)
+
 
 
 @app.get("/api/nearest")
