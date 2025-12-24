@@ -163,11 +163,12 @@ def health():
 def get_city(city_id: int):
     with connect() as con:
         # PATCH: require & return continent/country
-        require_cols(con, "cities", ["continent", "country"])
+        require_cols(con, "cities", ["continent", "country", "svg_x", "svg_y"])
 
         row = con.execute(
             """
             SELECT city_id, name, lat, lon,
+                   svg_x, svg_y
                    elev_ft_refined AS elev_ft,
                    trewartha, biomes,
                    continent, country,
@@ -340,9 +341,9 @@ def cities_by_continent(continent: str, limit: int = 5000, offset: int = 0):
     offset = max(0, offset)
 
     with connect() as con:
-        require_cols(con, "cities", ["continent"])
+        require_cols(con, "cities", ["continent", "svg_x", "svg_y"])
         rows = con.execute(
-            "SELECT city_id, name, lat, lon "
+            "SELECT city_id, name, lat, lon, svg_x, svg_y "
             "FROM cities "
             "WHERE continent = ? "
             "ORDER BY city_id "
@@ -362,9 +363,9 @@ def cities_by_country(country: str, limit: int = 5000, offset: int = 0):
     offset = max(0, offset)
 
     with connect() as con:
-        require_cols(con, "cities", ["country"])
+        require_cols(con, "cities", ["country", "svg_x", "svg_y"])
         rows = con.execute(
-            "SELECT city_id, name, lat, lon "
+            "SELECT city_id, name, lat, lon, svg_x, svg_y "
             "FROM cities "
             "WHERE country = ? "
             "ORDER BY city_id "
