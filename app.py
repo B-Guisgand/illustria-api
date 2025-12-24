@@ -98,8 +98,6 @@ def ensure_db_present() -> None:
             tmp_target = db_path.with_suffix(db_path.suffix + ".tmp")
             shutil.copyfile(tmp_db, tmp_target)
             os.replace(tmp_target, db_path)
-            if tmp_target.stat().st_size < 1_000_000:
-                raise RuntimeError("Copied DB is unexpectedly small; refusing to install.")
 
 
     # Final validation
