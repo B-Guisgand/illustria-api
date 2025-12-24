@@ -98,7 +98,8 @@ def ensure_db_present() -> None:
             tmp_target = db_path.with_suffix(db_path.suffix + ".tmp")
             shutil.copyfile(tmp_db, tmp_target)
             os.replace(tmp_target, db_path)
-
+            if tmp_target.stat().st_size < 1_000_000:
+                raise RuntimeError("Copied DB is unexpectedly small; refusing to install.")
 
 
     # Final validation
@@ -106,8 +107,7 @@ def ensure_db_present() -> None:
         with open(db_path, "rb") as f:
             head = f.read(64)
         raise RuntimeError(f"Extracted file is not SQLite. Head={head!r}")
-    if tmp_target.stat().st_size < 1_000_000:
-    raise RuntimeError("Copied DB is unexpectedly small; refusing to install.")
+    
 
 
 def connect() -> sqlite3.Connection:
