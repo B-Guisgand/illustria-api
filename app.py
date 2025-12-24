@@ -211,6 +211,28 @@ def nearest_city(lat: float, lon: float):
         "distance_mi": d,
     }
 
+@app.get("/api/nearest_svg")
+def nearest_city_svg(svg_x: float, svg_y: float):
+    with connect() as con:
+        require_cols(con, "cities", ["svg_x", "svg_y"])
+        rows = con.execute(
+            "SELECT city_id, name, svg_x, svg_y FROM cities WHERE svg_x IS NOT NULL AND svg_y IS NOT NULL;"
+        ).fetchall()
+
+    best = None
+    for r in rows:
+        dx = (r["svg_x"] - svg_x)
+        dy = (r["svg_y"] - svg_y)
+        d2 = dx*dx + dy*dy
+        if best is None or d2 < best[0]:
+            best = (d2, r)
+
+    if not best:
+        raise HTTPException(404, "No cities found")
+
+    _, r = best
+    return dict(r)
+
 
 @app.get("/api/forecast")
 def forecast(city_id: int, month: int, day: int, tod: int = 0, days: int = 7):
